@@ -1,17 +1,12 @@
-# Sanna Preview Layouts (plugin OBS)
+# Sanna Multiview (plugin OBS)
 
-Dock OBS pour **sauver la disposition de tes sources** (position, taille, rotation, bounding box, crop, visibilité, ordre des calques) et **la rappeler sur la scène en Preview** en un clic.
+Multiview personnalisable pour OBS 30.1+ : Aperçu/Programme en haut, grille de cases en dessous, et tu choisis quelle **scène ou source** va dans quelle case.
 
-- Studio Mode ON → agit sur la scène en **Preview**
-- Studio Mode OFF → agit sur la scène courante
-- Les layouts sont globaux : un layout sauvé sur la scène A peut s'appliquer sur la scène B. Les sources sont matchées **par nom** (les sources absentes sont ignorées).
-- Stockage : `%APPDATA%\obs-studio\plugin_config\sanna-preview-layouts\layouts.json`
-
-## Utilisation
-1. `Docks` → **Layouts Preview**
-2. Place tes sources dans la scène en Preview → tape un nom → **Sauver**
-3. Sélectionne un layout → **Appliquer** (ou double-clic)
-4. **Mettre à jour** = remplace le layout sélectionné par la disposition actuelle
+- **Docks → Multiview Sanna** (dock), ou **Outils → Multiview Sanna (plein écran)**
+- Clic = met la scène en Aperçu · double-clic = Transition
+- Glisser une case sur une autre = échanger
+- Clic droit = mettre une scène/source, vider, grille (lignes/colonnes), noms, plein écran
+- Réglages sauvés par collection de scènes
 
 ## Build (Windows) — le plus simple : GitHub Actions
 1. Crée un repo GitHub (ex. `sanna-preview-layouts`) et pousse ce dossier sur `main`.
