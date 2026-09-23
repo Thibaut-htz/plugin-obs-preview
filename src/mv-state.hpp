@@ -8,22 +8,30 @@
 #include <mutex>
 #include <vector>
 
-/* Une case du multiview : une scène OU une source, + son étiquette texte. */
-struct MvCell {
-	QString name;
+/* Canevas du multiview : toutes les cases sont placées en coordonnées 1920x1080. */
+constexpr double MV_CANVAS_W = 1920.0;
+constexpr double MV_CANVAS_H = 1080.0;
+
+enum MvKind { MV_EMPTY = 0, MV_PREVIEW = 1, MV_PROGRAM = 2, MV_SOURCE = 3 };
+
+struct MvTile {
+	QRectF rect; // coordonnées canevas
+	int kind = MV_EMPTY;
+	QString name; // scène ou source (MV_SOURCE)
 	obs_weak_source_t *weak = nullptr;
-	obs_source_t *label = nullptr; // source texte privée (nom affiché)
+	obs_source_t *label = nullptr;
 };
 
-/* Copie « sûre » de l'état pour le thread de rendu (références fortes). */
+/* Copie « sûre » pour le thread graphique (références fortes). */
 struct MvSnapshot {
-	int rows = 0, cols = 0;
-	bool showTop = true, showLabels = true;
+	bool showLabels = true;
 	struct Item {
+		QRectF rect;
+		int kind = MV_EMPTY;
 		obs_source_t *src = nullptr;
 		obs_source_t *label = nullptr;
 	};
-	std::vector<Item> cells;
+	std::vector<Item> tiles;
 	obs_source_t *previewScene = nullptr;
 	obs_source_t *programScene = nullptr;
 	obs_source_t *previewLabel = nullptr;
@@ -31,51 +39,49 @@ struct MvSnapshot {
 	void release();
 };
 
-struct MvLayout {
-	QRectF preview, program;
-	std::vector<QRectF> cells;
+struct MvPreset {
+	const char *key; // clé de traduction
+	std::vector<std::pair<QRectF, int>> tiles;
 };
+const std::vector<MvPreset> &mvPresets();
 
-MvLayout mvComputeLayout(double w, double h, int rows, int cols, bool showTop);
-
-/* État global partagé par le dock et les fenêtres plein écran.
- * Toutes les fonctions publiques (sauf snapshot) : thread UI seulement. */
+/* État global partagé (dock + plein écran). Fonctions publiques : thread UI,
+ * sauf snapshot() (thread graphique). */
 class MvState {
 public:
 	static MvState &get();
 
-	MvSnapshot snapshot(); // appelé depuis le thread graphique
+	MvSnapshot snapshot();
 
-	int rows();
-	int cols();
-	bool showTop();
+	int tileCount();
+	QRectF tileRect(int i);
+	int tileKind(int i);
+	QString tileName(int i);
 	bool showLabels();
-	QString cellName(int idx);
-	int cellCount();
 
-	void setCell(int idx, const QString &name);
-	void swapCells(int a, int b);
-	void setGrid(int rows, int cols);
-	void setShowTop(bool v);
+	int addTile(const QRectF &rect, int kind = MV_EMPTY, const QString &name = QString());
+	void removeTile(int i);
+	void setTileRect(int i, const QRectF &rect, bool saveNow = true);
+	void setTileContent(int i, int kind, const QString &name = QString());
+	int raiseTile(int i);
+	int duplicateTile(int i);
+	void applyPreset(size_t presetIdx);
+	void clearAll();
 	void setShowLabels(bool v);
-	void autoFill();
-	void clearCells();
 
-	void refreshFrontend(); // met à jour preview/programme
+	void refreshFrontend();
 	void createTopLabels();
-	void load(); // charge la config de la collection de scènes courante
+	void load();
 	void save();
-	void shutdown(); // libère tout (fermeture d'OBS / changement de collection)
+	void shutdown();
 
 private:
 	MvState() = default;
-	void setCellInternal(int idx, const QString &name);
-	void replaceCells(std::vector<MvCell> &&newCells);
+	void replaceTiles(std::vector<MvTile> &&next);
 
 	std::mutex mtx;
-	int rows_ = 3, cols_ = 6;
-	bool showTop_ = true, showLabels_ = true;
-	std::vector<MvCell> cells_;
+	std::vector<MvTile> tiles_;
+	bool showLabels_ = true;
 	obs_weak_source_t *preview_ = nullptr;
 	obs_weak_source_t *program_ = nullptr;
 	obs_source_t *previewLabel_ = nullptr;

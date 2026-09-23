@@ -21,6 +21,7 @@
 #include <QWindow>
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 static inline QString T(const char *key)
@@ -34,14 +35,32 @@ static std::vector<QPointer<MultiviewWidget>> &fullscreenWindows()
 	return w;
 }
 
-/* Couleurs au format 0xAABBGGRR */
+/* Couleurs 0xAABBGGRR */
 static const uint32_t COLOR_PROGRAM = 0xFF0000D0;  // rouge
 static const uint32_t COLOR_PREVIEW = 0xFF00C000;  // vert
-static const uint32_t COLOR_DRAGFROM = 0xFF00D7FF; // jaune
-static const uint32_t COLOR_DRAGOVER = 0xFFFFA000; // bleu
-static const uint32_t COLOR_CELL_BG = 0xFF000000;
-static const uint32_t COLOR_EMPTY_BG = 0xFF1C1C1C;
+static const uint32_t COLOR_SELECTED = 0xFF00D7FF; // jaune
+static const uint32_t COLOR_EDIT = 0x90FFFFFF;     // contour en mode édition
+static const uint32_t COLOR_HANDLE = 0xFFFFFFFF;
+static const uint32_t COLOR_CANVAS = 0xFF101010;
+static const uint32_t COLOR_TILE_BG = 0xFF000000;
+static const uint32_t COLOR_EMPTY_BG = 0xFF262626;
 static const uint32_t COLOR_LABEL_BG = 0xA0000000;
+
+static const double SNAP = 10.0;
+
+struct View {
+	double s, ox, oy;
+	QRectF map(const QRectF &r) const
+	{
+		return QRectF(ox + r.x() * s, oy + r.y() * s, r.width() * s, r.height() * s);
+	}
+};
+
+static View computeView(double w, double h)
+{
+	const double s = std::max(0.0001, std::min(w / MV_CANVAS_W, h / MV_CANVAS_H));
+	return {s, (w - MV_CANVAS_W * s) / 2.0, (h - MV_CANVAS_H * s) / 2.0};
+}
 
 /* ------------------------------------------------------------------ */
 /* Dessin                                                             */
@@ -69,7 +88,15 @@ static void drawBox(const QRectF &r, uint32_t color)
 	drawBox((float)r.x(), (float)r.y(), (float)r.width(), (float)r.height(), color);
 }
 
-/* Rend une source dans un rectangle, en gardant son ratio (viewport = découpe propre). */
+static void drawOutline(const QRectF &r, uint32_t color, float t)
+{
+	drawBox((float)r.x(), (float)r.y(), (float)r.width(), t, color);
+	drawBox((float)r.x(), (float)(r.bottom() - t), (float)r.width(), t, color);
+	drawBox((float)r.x(), (float)(r.y() + t), t, (float)(r.height() - 2 * t), color);
+	drawBox((float)(r.right() - t), (float)(r.y() + t), t, (float)(r.height() - 2 * t), color);
+}
+
+/* Rend une source dans un rectangle en gardant son ratio (viewport = découpe propre). */
 static void drawSourceFit(obs_source_t *src, const QRectF &r, uint32_t sw, uint32_t sh)
 {
 	if (!src || !sw || !sh || r.width() < 2 || r.height() < 2)
@@ -88,23 +115,22 @@ static void drawSourceFit(obs_source_t *src, const QRectF &r, uint32_t sw, uint3
 	gs_viewport_pop();
 }
 
-static void drawLabel(obs_source_t *label, const QRectF &cell, double heightRatio)
+static void drawLabel(obs_source_t *label, const QRectF &r, double targetH)
 {
 	if (!label)
 		return;
 	const uint32_t lw = obs_source_get_width(label);
 	const uint32_t lh = obs_source_get_height(label);
-	if (!lw || !lh)
+	if (!lw || !lh || targetH < 4)
 		return;
 
-	const double targetH = std::max(10.0, cell.height() * heightRatio);
 	double sc = targetH / lh;
-	if (lw * sc > cell.width() * 0.9)
-		sc = cell.width() * 0.9 / lw;
+	if (lw * sc > r.width() * 0.9)
+		sc = r.width() * 0.9 / lw;
 	const double w = lw * sc, h = lh * sc;
 	const double pad = h * 0.25;
-	const double x = cell.x() + (cell.width() - w) / 2.0;
-	const double y = cell.y() + cell.height() - h - pad * 2.0;
+	const double x = r.x() + (r.width() - w) / 2.0;
+	const double y = r.y() + r.height() - h - pad * 2.0;
 
 	drawBox((float)(x - pad), (float)(y - pad * 0.5), (float)(w + pad * 2), (float)(h + pad), COLOR_LABEL_BG);
 
@@ -116,28 +142,20 @@ static void drawLabel(obs_source_t *label, const QRectF &cell, double heightRati
 	gs_matrix_pop();
 }
 
-static void drawFramed(const QRectF &r, uint32_t border, float thickness)
-{
-	if (border) {
-		drawBox(r, border);
-		drawBox(r.adjusted(thickness, thickness, -thickness, -thickness), COLOR_CELL_BG);
-	} else {
-		drawBox(r.adjusted(1, 1, -1, -1), COLOR_CELL_BG);
-	}
-}
-
 void MultiviewWidget::drawCallback(void *data, uint32_t cx, uint32_t cy)
 {
 	auto *self = static_cast<MultiviewWidget *>(data);
 	MvSnapshot s = MvState::get().snapshot();
-	const MvLayout l = mvComputeLayout(cx, cy, s.rows, s.cols, s.showTop);
+	const View v = computeView(cx, cy);
 
 	obs_video_info ovi = {};
 	obs_get_video_info(&ovi);
 	const uint32_t baseW = ovi.base_width ? ovi.base_width : 1920;
 	const uint32_t baseH = ovi.base_height ? ovi.base_height : 1080;
 	const bool studio = s.previewScene && s.previewScene != s.programScene;
-	const float thick = std::max(2.0f, (float)cy / 270.0f);
+	const bool edit = self->editMode.load();
+	const int sel = self->selected.load();
+	const float thick = (float)std::max(2.0, 4.0 * v.s);
 
 	gs_viewport_push();
 	gs_projection_push();
@@ -147,51 +165,64 @@ void MultiviewWidget::drawCallback(void *data, uint32_t cx, uint32_t cy)
 	gs_enable_blending(true);
 	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
 
-	/* --- Haut : Aperçu + Programme --- */
-	if (s.showTop) {
-		drawFramed(l.preview, COLOR_PREVIEW, thick);
-		drawSourceFit(s.previewScene, l.preview.adjusted(thick, thick, -thick, -thick), baseW, baseH);
-		if (s.showLabels)
-			drawLabel(s.previewLabel, l.preview, 0.07);
+	drawBox(v.map(QRectF(0, 0, MV_CANVAS_W, MV_CANVAS_H)), COLOR_CANVAS);
 
-		drawFramed(l.program, COLOR_PROGRAM, thick);
-		obs_source_t *out = obs_get_output_source(0); // inclut les transitions en cours
-		drawSourceFit(out, l.program.adjusted(thick, thick, -thick, -thick), baseW, baseH);
-		obs_source_release(out);
-		if (s.showLabels)
-			drawLabel(s.programLabel, l.program, 0.07);
-	}
-
-	/* --- Grille --- */
-	const int from = self->dragFrom.load();
-	const int over = self->dragOver.load();
-	for (size_t i = 0; i < l.cells.size() && i < s.cells.size(); i++) {
-		const QRectF &r = l.cells[i];
-		obs_source_t *src = s.cells[i].src;
+	for (size_t i = 0; i < s.tiles.size(); i++) {
+		const MvSnapshot::Item &t = s.tiles[i];
+		const QRectF r = v.map(t.rect);
+		const QRectF inner = r.adjusted(thick, thick, -thick, -thick);
 
 		uint32_t border = 0;
-		if ((int)i == from)
-			border = COLOR_DRAGFROM;
-		else if ((int)i == over)
-			border = COLOR_DRAGOVER;
-		else if (src && src == s.programScene)
-			border = COLOR_PROGRAM;
-		else if (src && studio && src == s.previewScene)
-			border = COLOR_PREVIEW;
+		obs_source_t *content = nullptr;
+		obs_source_t *label = nullptr;
+		uint32_t sw = baseW, sh = baseH;
+		bool release = false;
 
-		drawFramed(r, border, thick);
-		const QRectF inner = r.adjusted(thick, thick, -thick, -thick);
-		if (!src) {
-			drawBox(inner, COLOR_EMPTY_BG);
-			continue;
+		switch (t.kind) {
+		case MV_PREVIEW:
+			border = COLOR_PREVIEW;
+			content = s.previewScene;
+			label = s.previewLabel;
+			break;
+		case MV_PROGRAM:
+			border = COLOR_PROGRAM;
+			content = obs_get_output_source(0); // inclut la transition en cours
+			release = true;
+			label = s.programLabel;
+			break;
+		case MV_SOURCE:
+			content = t.src;
+			label = t.label;
+			if (t.src && t.src == s.programScene)
+				border = COLOR_PROGRAM;
+			else if (t.src && studio && t.src == s.previewScene)
+				border = COLOR_PREVIEW;
+			if (t.src && !obs_scene_from_source(t.src)) {
+				sw = obs_source_get_width(t.src);
+				sh = obs_source_get_height(t.src);
+			}
+			break;
+		default:
+			break;
 		}
 
-		const bool isScene = obs_scene_from_source(src) != nullptr;
-		const uint32_t sw = isScene ? baseW : obs_source_get_width(src);
-		const uint32_t sh = isScene ? baseH : obs_source_get_height(src);
-		drawSourceFit(src, inner, sw, sh);
-		if (s.showLabels)
-			drawLabel(s.cells[i].label, inner, 0.13);
+		if (border)
+			drawBox(r, border);
+		drawBox(border ? inner : r.adjusted(1, 1, -1, -1), content ? COLOR_TILE_BG : COLOR_EMPTY_BG);
+		drawSourceFit(content, inner, sw, sh);
+		if (release)
+			obs_source_release(content);
+
+		if (s.showLabels && content)
+			drawLabel(label, inner, std::clamp(t.rect.height() * 0.12, 16.0, 44.0) * v.s);
+
+		if (edit) {
+			drawOutline(r, (int)i == sel ? COLOR_SELECTED : COLOR_EDIT,
+				    (int)i == sel ? thick : std::max(1.0f, thick / 2));
+			const float hs = (float)std::max(8.0, 24.0 * v.s);
+			drawBox((float)(r.right() - hs), (float)(r.bottom() - hs), hs, hs,
+				(int)i == sel ? COLOR_SELECTED : COLOR_HANDLE);
+		}
 	}
 
 	gs_blend_state_pop();
@@ -212,13 +243,11 @@ MultiviewWidget::MultiviewWidget(QWidget *parent, bool fullscreen) : QWidget(par
 	setAttribute(Qt::WA_OpaquePaintEvent);
 	setAttribute(Qt::WA_DontCreateNativeAncestors);
 	setAttribute(Qt::WA_NativeWindow);
-	setMouseTracking(false);
 	setFocusPolicy(Qt::StrongFocus);
 	setMinimumSize(160, 90);
 	if (fullscreen) {
 		setAttribute(Qt::WA_DeleteOnClose);
 		setWindowTitle(T("DockTitle"));
-		setCursor(Qt::ArrowCursor);
 	}
 }
 
@@ -233,12 +262,9 @@ void MultiviewWidget::createDisplay()
 		return;
 
 	const qreal dpr = devicePixelRatioF();
-	const uint32_t w = (uint32_t)std::max(1.0, width() * dpr);
-	const uint32_t h = (uint32_t)std::max(1.0, height() * dpr);
-
 	gs_init_data info = {};
-	info.cx = w;
-	info.cy = h;
+	info.cx = (uint32_t)std::max(1.0, width() * dpr);
+	info.cy = (uint32_t)std::max(1.0, height() * dpr);
 	info.format = GS_BGRA;
 	info.zsformat = GS_ZS_NONE;
 #if defined(_WIN32)
@@ -247,7 +273,7 @@ void MultiviewWidget::createDisplay()
 	info.window.id = (uint32_t)winId();
 	info.window.display = obs_get_nix_platform_display();
 #else
-	return; // macOS non géré dans cette version
+	return; // macOS non géré
 #endif
 
 	display = obs_display_create(&info, 0xFF4C4C4C);
@@ -298,31 +324,59 @@ void MultiviewWidget::resizeEvent(QResizeEvent *e)
 }
 
 /* ------------------------------------------------------------------ */
-/* Souris                                                             */
+/* Coordonnées                                                        */
 
-int MultiviewWidget::cellAt(const QPoint &pos) const
+double MultiviewWidget::viewScale() const
+{
+	const qreal dpr = devicePixelRatioF();
+	return computeView(width() * dpr, height() * dpr).s / dpr;
+}
+
+QPointF MultiviewWidget::toCanvas(const QPoint &p) const
+{
+	const qreal dpr = devicePixelRatioF();
+	const View v = computeView(width() * dpr, height() * dpr);
+	return QPointF((p.x() * dpr - v.ox) / v.s, (p.y() * dpr - v.oy) / v.s);
+}
+
+int MultiviewWidget::tileAt(const QPointF &c) const
 {
 	MvState &st = MvState::get();
-	const qreal dpr = devicePixelRatioF();
-	const MvLayout l = mvComputeLayout(width() * dpr, height() * dpr, st.rows(), st.cols(), st.showTop());
-	const QPointF p(pos.x() * dpr, pos.y() * dpr);
-	for (size_t i = 0; i < l.cells.size(); i++)
-		if (l.cells[i].contains(p))
-			return (int)i;
+	for (int i = st.tileCount() - 1; i >= 0; i--) // la plus au-dessus d'abord
+		if (st.tileRect(i).contains(c))
+			return i;
 	return -1;
 }
 
-obs_source_t *MultiviewWidget::cellSource(int idx) const
+bool MultiviewWidget::onHandle(int tile, const QPointF &c) const
 {
-	const QString name = MvState::get().cellName(idx);
-	if (name.isEmpty())
-		return nullptr;
-	return obs_get_source_by_name(name.toUtf8().constData());
+	const QRectF r = MvState::get().tileRect(tile);
+	const double hs = std::max(30.0, 16.0 / viewScale()); // zone de prise en coin bas-droit
+	return QRectF(r.right() - hs, r.bottom() - hs, hs, hs).contains(c);
 }
 
-void MultiviewWidget::selectCell(int idx, bool transition)
+static double snapV(double v, bool enabled)
 {
-	obs_source_t *src = cellSource(idx);
+	return enabled ? std::round(v / SNAP) * SNAP : v;
+}
+
+/* ------------------------------------------------------------------ */
+/* Souris / clavier                                                   */
+
+void MultiviewWidget::setEditMode(bool on)
+{
+	editMode = on;
+	if (!on)
+		selected = -1;
+	setCursor(on ? Qt::SizeAllCursor : Qt::ArrowCursor);
+}
+
+void MultiviewWidget::selectTile(int tile, bool transition)
+{
+	MvState &st = MvState::get();
+	if (st.tileKind(tile) != MV_SOURCE)
+		return;
+	obs_source_t *src = obs_get_source_by_name(st.tileName(tile).toUtf8().constData());
 	if (!src)
 		return;
 	if (obs_scene_from_source(src)) {
@@ -340,25 +394,40 @@ void MultiviewWidget::selectCell(int idx, bool transition)
 void MultiviewWidget::mousePressEvent(QMouseEvent *e)
 {
 	if (e->button() == Qt::LeftButton) {
-		pressCell = cellAt(e->pos());
-		pressPos = e->pos();
-		dragging = false;
+		pressCanvas = toCanvas(e->pos());
+		pressTile = tileAt(pressCanvas);
+		moved = false;
+		dragMode = DragNone;
+		if (editMode) {
+			selected = pressTile;
+			if (pressTile >= 0) {
+				pressRect = MvState::get().tileRect(pressTile);
+				dragMode = onHandle(pressTile, pressCanvas) ? DragResize : DragMove;
+			}
+		}
 	}
 	QWidget::mousePressEvent(e);
 }
 
 void MultiviewWidget::mouseMoveEvent(QMouseEvent *e)
 {
-	if ((e->buttons() & Qt::LeftButton) && pressCell >= 0) {
-		if (!dragging && (e->pos() - pressPos).manhattanLength() > 10) {
-			dragging = true;
-			dragFrom = pressCell;
-			setCursor(Qt::ClosedHandCursor);
+	if (editMode && (e->buttons() & Qt::LeftButton) && pressTile >= 0 && dragMode != DragNone) {
+		const QPointF d = toCanvas(e->pos()) - pressCanvas;
+		const bool snap = !(e->modifiers() & Qt::AltModifier);
+		QRectF r = pressRect;
+		if (dragMode == DragMove) {
+			r.moveTo(snapV(pressRect.x() + d.x(), snap), snapV(pressRect.y() + d.y(), snap));
+		} else {
+			const double w = std::max(80.0, snapV(pressRect.width() + d.x(), snap));
+			double h;
+			if (e->modifiers() & Qt::ShiftModifier) // Maj = taille libre
+				h = std::max(45.0, snapV(pressRect.height() + d.y(), snap));
+			else
+				h = w * 9.0 / 16.0; // 16:9 par défaut
+			r.setSize(QSizeF(w, h));
 		}
-		if (dragging) {
-			const int over = cellAt(e->pos());
-			dragOver = (over == pressCell) ? -1 : over;
-		}
+		MvState::get().setTileRect(pressTile, r, false);
+		moved = true;
 	}
 	QWidget::mouseMoveEvent(e);
 }
@@ -366,37 +435,55 @@ void MultiviewWidget::mouseMoveEvent(QMouseEvent *e)
 void MultiviewWidget::mouseReleaseEvent(QMouseEvent *e)
 {
 	if (e->button() == Qt::LeftButton) {
-		if (dragging) {
-			const int over = cellAt(e->pos());
-			if (over >= 0 && over != pressCell)
-				MvState::get().swapCells(pressCell, over);
-			unsetCursor();
-		} else if (pressCell >= 0) {
-			selectCell(pressCell, false);
+		if (editMode) {
+			if (moved)
+				MvState::get().save();
+		} else if (pressTile >= 0) {
+			selectTile(pressTile, false);
 		}
-		dragging = false;
-		dragFrom = -1;
-		dragOver = -1;
-		pressCell = -1;
+		dragMode = DragNone;
+		pressTile = -1;
+		moved = false;
 	}
 	QWidget::mouseReleaseEvent(e);
 }
 
 void MultiviewWidget::mouseDoubleClickEvent(QMouseEvent *e)
 {
-	if (e->button() == Qt::LeftButton) {
-		const int idx = cellAt(e->pos());
-		if (idx >= 0)
-			selectCell(idx, true);
+	if (e->button() == Qt::LeftButton && !editMode) {
+		const int t = tileAt(toCanvas(e->pos()));
+		if (t >= 0)
+			selectTile(t, true);
 	}
 	QWidget::mouseDoubleClickEvent(e);
 }
 
 void MultiviewWidget::keyPressEvent(QKeyEvent *e)
 {
-	if (fullscreenWindow && e->key() == Qt::Key_Escape) {
-		close();
+	switch (e->key()) {
+	case Qt::Key_Delete:
+	case Qt::Key_Backspace:
+		if (editMode && selected >= 0) {
+			MvState::get().removeTile(selected);
+			selected = -1;
+			return;
+		}
+		break;
+	case Qt::Key_E:
+		setEditMode(!editMode);
 		return;
+	case Qt::Key_Escape:
+		if (editMode) {
+			setEditMode(false);
+			return;
+		}
+		if (fullscreenWindow) {
+			close();
+			return;
+		}
+		break;
+	default:
+		break;
 	}
 	QWidget::keyPressEvent(e);
 }
@@ -407,89 +494,144 @@ void MultiviewWidget::keyPressEvent(QKeyEvent *e)
 static bool collectVideoSource(void *param, obs_source_t *src)
 {
 	auto *list = static_cast<QStringList *>(param);
-	const uint32_t flags = obs_source_get_output_flags(src);
-	if ((flags & OBS_SOURCE_VIDEO) && obs_source_get_type(src) == OBS_SOURCE_TYPE_INPUT)
+	if ((obs_source_get_output_flags(src) & OBS_SOURCE_VIDEO) && obs_source_get_type(src) == OBS_SOURCE_TYPE_INPUT)
 		list->append(QString::fromUtf8(obs_source_get_name(src)));
 	return true;
+}
+
+static void addContentActions(QMenu *menu, QObject *ctx, int tile)
+{
+	MvState &st = MvState::get();
+	const int kind = st.tileKind(tile);
+	const QString current = kind == MV_SOURCE ? st.tileName(tile) : QString();
+
+	QAction *prev = menu->addAction(T("Preview"));
+	prev->setCheckable(true);
+	prev->setChecked(kind == MV_PREVIEW);
+	QObject::connect(prev, &QAction::triggered, ctx, [tile]() { MvState::get().setTileContent(tile, MV_PREVIEW); });
+
+	QAction *prog = menu->addAction(T("Program"));
+	prog->setCheckable(true);
+	prog->setChecked(kind == MV_PROGRAM);
+	QObject::connect(prog, &QAction::triggered, ctx, [tile]() { MvState::get().setTileContent(tile, MV_PROGRAM); });
+
+	QMenu *scenesMenu = menu->addMenu(T("AssignScene"));
+	obs_frontend_source_list scenes = {};
+	obs_frontend_get_scenes(&scenes);
+	for (size_t i = 0; i < scenes.sources.num; i++) {
+		const QString name = QString::fromUtf8(obs_source_get_name(scenes.sources.array[i]));
+		QAction *a = scenesMenu->addAction(name);
+		a->setCheckable(true);
+		a->setChecked(name == current);
+		QObject::connect(a, &QAction::triggered, ctx,
+				 [tile, name]() { MvState::get().setTileContent(tile, MV_SOURCE, name); });
+	}
+	obs_frontend_source_list_free(&scenes);
+
+	QMenu *sourcesMenu = menu->addMenu(T("AssignSource"));
+	QStringList sources;
+	obs_enum_sources(collectVideoSource, &sources);
+	sources.sort(Qt::CaseInsensitive);
+	for (const QString &name : sources) {
+		QAction *a = sourcesMenu->addAction(name);
+		a->setCheckable(true);
+		a->setChecked(name == current);
+		QObject::connect(a, &QAction::triggered, ctx,
+				 [tile, name]() { MvState::get().setTileContent(tile, MV_SOURCE, name); });
+	}
+	sourcesMenu->setEnabled(!sources.isEmpty());
+
+	QAction *clear = menu->addAction(T("ClearCell"));
+	clear->setEnabled(kind != MV_EMPTY);
+	QObject::connect(clear, &QAction::triggered, ctx, [tile]() { MvState::get().setTileContent(tile, MV_EMPTY); });
 }
 
 void MultiviewWidget::contextMenuEvent(QContextMenuEvent *e)
 {
 	MvState &st = MvState::get();
-	const int idx = cellAt(e->pos());
+	const QPointF c = toCanvas(e->pos());
+	const int tile = tileAt(c);
 	QMenu menu(this);
 
-	if (idx >= 0) {
-		const QString current = st.cellName(idx);
-		menu.addSection(current.isEmpty() ? T("EmptyCell") : current);
-
-		QMenu *scenesMenu = menu.addMenu(T("AssignScene"));
-		obs_frontend_source_list scenes = {};
-		obs_frontend_get_scenes(&scenes);
-		for (size_t i = 0; i < scenes.sources.num; i++) {
-			const QString name = QString::fromUtf8(obs_source_get_name(scenes.sources.array[i]));
-			QAction *a = scenesMenu->addAction(name);
-			a->setCheckable(true);
-			a->setChecked(name == current);
-			connect(a, &QAction::triggered, this, [idx, name]() { MvState::get().setCell(idx, name); });
-		}
-		obs_frontend_source_list_free(&scenes);
-
-		QMenu *sourcesMenu = menu.addMenu(T("AssignSource"));
-		QStringList sources;
-		obs_enum_sources(collectVideoSource, &sources);
-		sources.sort(Qt::CaseInsensitive);
-		for (const QString &name : sources) {
-			QAction *a = sourcesMenu->addAction(name);
-			a->setCheckable(true);
-			a->setChecked(name == current);
-			connect(a, &QAction::triggered, this, [idx, name]() { MvState::get().setCell(idx, name); });
-		}
-		if (sources.isEmpty())
-			sourcesMenu->setEnabled(false);
-
-		QAction *clear = menu.addAction(T("ClearCell"));
-		clear->setEnabled(!current.isEmpty());
-		connect(clear, &QAction::triggered, this, [idx]() { MvState::get().setCell(idx, QString()); });
+	if (tile >= 0) {
+		const int kind = st.tileKind(tile);
+		QString title = kind == MV_PREVIEW   ? T("Preview")
+				: kind == MV_PROGRAM ? T("Program")
+				: kind == MV_SOURCE  ? st.tileName(tile)
+						     : T("EmptyCell");
+		menu.addSection(title);
+		addContentActions(&menu, this, tile);
 		menu.addSeparator();
+
+		QMenu *size = menu.addMenu(T("TileSize"));
+		const QList<QPair<QString, QSizeF>> sizes = {
+			{QStringLiteral("1920 × 1080 (plein)"), QSizeF(1920, 1080)},
+			{QStringLiteral("1440 × 810 (3/4)"), QSizeF(1440, 810)},
+			{QStringLiteral("960 × 540 (1/2)"), QSizeF(960, 540)},
+			{QStringLiteral("640 × 360 (1/3)"), QSizeF(640, 360)},
+			{QStringLiteral("480 × 270 (1/4)"), QSizeF(480, 270)},
+			{QStringLiteral("320 × 180 (1/6)"), QSizeF(320, 180)},
+		};
+		for (const auto &sz : sizes) {
+			QAction *a = size->addAction(sz.first);
+			const QSizeF s = sz.second;
+			connect(a, &QAction::triggered, this, [tile, s]() {
+				QRectF r = MvState::get().tileRect(tile);
+				r.setSize(s);
+				MvState::get().setTileRect(tile, r);
+			});
+		}
+
+		QAction *dup = menu.addAction(T("Duplicate"));
+		connect(dup, &QAction::triggered, this,
+			[this, tile]() { selected = MvState::get().duplicateTile(tile); });
+		QAction *raise = menu.addAction(T("BringToFront"));
+		connect(raise, &QAction::triggered, this,
+			[this, tile]() { selected = MvState::get().raiseTile(tile); });
+		QAction *del = menu.addAction(T("DeleteTile"));
+		connect(del, &QAction::triggered, this, [this, tile]() {
+			MvState::get().removeTile(tile);
+			selected = -1;
+		});
+	} else if (c.x() >= 0 && c.y() >= 0 && c.x() <= MV_CANVAS_W && c.y() <= MV_CANVAS_H) {
+		QAction *add = menu.addAction(T("AddTileHere"));
+		connect(add, &QAction::triggered, this, [this, c]() {
+			const QRectF r(snapV(c.x(), true), snapV(c.y(), true), 480, 270);
+			selected = MvState::get().addTile(r);
+			if (!editMode)
+				setEditMode(true);
+		});
 	}
 
-	/* Grille */
-	QMenu *gridMenu = menu.addMenu(T("Grid"));
-	QMenu *rowsMenu = gridMenu->addMenu(T("Rows"));
-	for (int r = 1; r <= 8; r++) {
-		QAction *a = rowsMenu->addAction(QString::number(r));
-		a->setCheckable(true);
-		a->setChecked(r == st.rows());
-		connect(a, &QAction::triggered, this, [r]() { MvState::get().setGrid(r, MvState::get().cols()); });
-	}
-	QMenu *colsMenu = gridMenu->addMenu(T("Columns"));
-	for (int c = 1; c <= 10; c++) {
-		QAction *a = colsMenu->addAction(QString::number(c));
-		a->setCheckable(true);
-		a->setChecked(c == st.cols());
-		connect(a, &QAction::triggered, this, [c]() { MvState::get().setGrid(MvState::get().rows(), c); });
-	}
+	menu.addSeparator();
+	QAction *edit = menu.addAction(T("EditMode"));
+	edit->setCheckable(true);
+	edit->setChecked(editMode);
+	connect(edit, &QAction::toggled, this, [this](bool on) { setEditMode(on); });
 
-	QAction *top = menu.addAction(T("ShowTop"));
-	top->setCheckable(true);
-	top->setChecked(st.showTop());
-	connect(top, &QAction::toggled, this, [](bool v) { MvState::get().setShowTop(v); });
+	QMenu *presets = menu.addMenu(T("Presets"));
+	const auto &list = mvPresets();
+	for (size_t i = 0; i < list.size(); i++) {
+		QAction *a = presets->addAction(T(list[i].key));
+		connect(a, &QAction::triggered, this, [this, i]() {
+			if (QMessageBox::question(this, T("DockTitle"), T("ConfirmPreset")) == QMessageBox::Yes) {
+				MvState::get().applyPreset(i);
+				selected = -1;
+			}
+		});
+	}
 
 	QAction *labels = menu.addAction(T("ShowLabels"));
 	labels->setCheckable(true);
 	labels->setChecked(st.showLabels());
 	connect(labels, &QAction::toggled, this, [](bool v) { MvState::get().setShowLabels(v); });
 
-	QAction *fill = menu.addAction(T("AutoFill"));
-	connect(fill, &QAction::triggered, this, [this]() {
-		if (QMessageBox::question(this, T("DockTitle"), T("ConfirmAutoFill")) == QMessageBox::Yes)
-			MvState::get().autoFill();
-	});
 	QAction *clearAll = menu.addAction(T("ClearAll"));
 	connect(clearAll, &QAction::triggered, this, [this]() {
-		if (QMessageBox::question(this, T("DockTitle"), T("ConfirmClearAll")) == QMessageBox::Yes)
-			MvState::get().clearCells();
+		if (QMessageBox::question(this, T("DockTitle"), T("ConfirmClearAll")) == QMessageBox::Yes) {
+			MvState::get().clearAll();
+			selected = -1;
+		}
 	});
 
 	menu.addSeparator();
@@ -502,7 +644,7 @@ void MultiviewWidget::contextMenuEvent(QContextMenuEvent *e)
 		for (int i = 0; i < screens.size(); i++) {
 			QScreen *scr = screens[i];
 			const QRect g = scr->geometry();
-			QAction *a = fs->addAction(QStringLiteral("%1 %2 — %3 (%4x%5)")
+			QAction *a = fs->addAction(QStringLiteral("%1 %2 — %3 (%4×%5)")
 							   .arg(T("Screen"))
 							   .arg(i + 1)
 							   .arg(scr->name())
@@ -524,7 +666,7 @@ MultiviewWidget *MultiviewWidget::openFullscreen(QScreen *screen)
 	w->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
 	if (screen) {
 		w->setGeometry(screen->geometry());
-		w->winId(); // crée la fenêtre native pour pouvoir choisir l'écran
+		w->winId();
 		if (w->windowHandle())
 			w->windowHandle()->setScreen(screen);
 	}

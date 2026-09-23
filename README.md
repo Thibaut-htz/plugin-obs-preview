@@ -1,12 +1,12 @@
 # Sanna Multiview (plugin OBS)
 
-Multiview personnalisable pour OBS 30.1+ : Aperçu/Programme en haut, grille de cases en dessous, et tu choisis quelle **scène ou source** va dans quelle case.
+Multiview 1920×1080 entièrement personnalisable pour OBS 30.1+.
 
-- **Docks → Multiview Sanna** (dock), ou **Outils → Multiview Sanna (plein écran)**
-- Clic = met la scène en Aperçu · double-clic = Transition
-- Glisser une case sur une autre = échanger
-- Clic droit = mettre une scène/source, vider, grille (lignes/colonnes), noms, plein écran
-- Réglages sauvés par collection de scènes
+- **Docks → Multiview Sanna**, ou **Outils → Multiview Sanna (plein écran)**
+- Clic = scène en Aperçu · double-clic = Transition
+- **E** = mode édition : glisser pour déplacer, coin bas-droit pour redimensionner (16:9, **Maj** = libre, **Alt** = sans aimant), **Suppr** = supprimer la case
+- Clic droit : contenu (Aperçu, Programme, scène, source), taille, dupliquer, supprimer, ajouter une case, modèles, plein écran
+- Disposition sauvée par collection de scènes
 
 ## Build (Windows) — le plus simple : GitHub Actions
 1. Crée un repo GitHub (ex. `sanna-preview-layouts`) et pousse ce dossier sur `main`.

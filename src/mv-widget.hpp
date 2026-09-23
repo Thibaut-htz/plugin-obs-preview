@@ -2,14 +2,15 @@
 
 #include <obs.h>
 
-#include <QPoint>
+#include <QPointF>
+#include <QRectF>
 #include <QWidget>
 
 #include <atomic>
 
 class QScreen;
 
-/* Affichage du multiview (utilisé dans le dock ET en plein écran). */
+/* Affichage du multiview (dock ET plein écran). */
 class MultiviewWidget : public QWidget {
 	Q_OBJECT
 
@@ -38,18 +39,26 @@ private slots:
 	void createDisplay();
 
 private:
+	enum DragMode { DragNone, DragMove, DragResize };
+
 	static void drawCallback(void *data, uint32_t cx, uint32_t cy);
 	void destroyDisplay();
-	int cellAt(const QPoint &pos) const;
-	obs_source_t *cellSource(int idx) const; // nouvelle réf
-	void selectCell(int idx, bool transition);
+	QPointF toCanvas(const QPoint &p) const;
+	double viewScale() const; // pixels écran par pixel canevas
+	int tileAt(const QPointF &c) const;
+	bool onHandle(int tile, const QPointF &c) const;
+	void selectTile(int tile, bool transition);
+	void setEditMode(bool on);
 
 	obs_display_t *display = nullptr;
 	bool fullscreenWindow = false;
 
-	int pressCell = -1;
-	QPoint pressPos;
-	bool dragging = false;
-	std::atomic<int> dragFrom{-1};
-	std::atomic<int> dragOver{-1};
+	std::atomic<bool> editMode{false};
+	std::atomic<int> selected{-1};
+
+	DragMode dragMode = DragNone;
+	int pressTile = -1;
+	QPointF pressCanvas;
+	QRectF pressRect;
+	bool moved = false;
 };

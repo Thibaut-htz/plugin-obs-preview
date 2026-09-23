@@ -9,6 +9,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QStringList>
 
 #include <algorithm>
 
@@ -24,12 +25,11 @@ static obs_source_t *createLabel(const QString &text)
 	obs_data_set_string(font, "face", "Arial");
 	obs_data_set_string(font, "style", "Bold");
 	obs_data_set_int(font, "size", 64);
-	obs_data_set_int(font, "flags", 1); // bold
+	obs_data_set_int(font, "flags", 1);
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_obj(settings, "font", font);
 	obs_data_set_string(settings, "text", text.toUtf8().constData());
-	obs_data_set_bool(settings, "outline", false);
 
 #ifdef _WIN32
 	const char *id = "text_gdiplus";
@@ -37,85 +37,123 @@ static obs_source_t *createLabel(const QString &text)
 	const char *id = "text_ft2_source";
 #endif
 	obs_source_t *src = obs_source_create_private(id, "sanna-mv-label", settings);
-
 	obs_data_release(settings);
 	obs_data_release(font);
 	return src;
 }
 
-static void releaseCell(MvCell &c)
+/* Libère le contenu d'une case (hors verrou !) */
+static void releaseContent(MvTile &t)
 {
-	if (c.weak) {
-		obs_source_t *src = obs_weak_source_get_source(c.weak);
+	if (t.weak) {
+		obs_source_t *src = obs_weak_source_get_source(t.weak);
 		if (src) {
 			obs_source_dec_showing(src);
 			obs_source_release(src);
 		}
-		obs_weak_source_release(c.weak);
+		obs_weak_source_release(t.weak);
 	}
-	obs_source_release(c.label);
-	c = MvCell();
+	obs_source_release(t.label);
+	t.weak = nullptr;
+	t.label = nullptr;
 }
 
-static MvCell makeCell(const QString &name)
+/* Remplit le contenu d'une case (hors verrou !) */
+static void makeContent(MvTile &t, int kind, const QString &name)
 {
-	MvCell c;
-	if (name.isEmpty())
-		return c;
-	obs_source_t *src = obs_get_source_by_name(name.toUtf8().constData());
-	if (!src)
-		return c;
-	c.name = name;
-	c.weak = obs_source_get_weak_source(src);
-	c.label = createLabel(name);
-	obs_source_inc_showing(src); // pour que les médias jouent même hors programme
+	t.kind = kind;
+	t.name.clear();
+	t.weak = nullptr;
+	t.label = nullptr;
+	if (kind != MV_SOURCE)
+		return;
+	obs_source_t *src = name.isEmpty() ? nullptr : obs_get_source_by_name(name.toUtf8().constData());
+	if (!src) {
+		t.kind = MV_EMPTY;
+		return;
+	}
+	t.name = name;
+	t.weak = obs_source_get_weak_source(src);
+	t.label = createLabel(name);
+	obs_source_inc_showing(src); // les médias jouent même hors programme
 	obs_source_release(src);
-	return c;
 }
 
-static double canvasAspect()
+static QRectF clampRect(QRectF r)
 {
-	obs_video_info ovi;
-	if (obs_get_video_info(&ovi) && ovi.base_width && ovi.base_height)
-		return (double)ovi.base_width / (double)ovi.base_height;
-	return 16.0 / 9.0;
+	r.setWidth(std::clamp(r.width(), 40.0, MV_CANVAS_W));
+	r.setHeight(std::clamp(r.height(), 22.0, MV_CANVAS_H));
+	r.moveLeft(std::clamp(r.x(), 0.0, MV_CANVAS_W - r.width()));
+	r.moveTop(std::clamp(r.y(), 0.0, MV_CANVAS_H - r.height()));
+	return r;
 }
 
-MvLayout mvComputeLayout(double w, double h, int rows, int cols, bool showTop)
+static QStringList sceneNames()
 {
-	MvLayout l;
-	if (w <= 0 || h <= 0 || rows <= 0 || cols <= 0)
-		return l;
-
-	const double aspect = canvasAspect();
-	const double topH = showTop ? (w / 2.0) / aspect : 0.0;
-	const double cellW = w / cols;
-	const double cellH = cellW / aspect;
-	const double totalH = topH + rows * cellH;
-	const double s = totalH > h ? h / totalH : 1.0;
-
-	const double W = w * s;
-	const double x0 = (w - W) / 2.0;
-	const double y0 = (h - totalH * s) / 2.0;
-
-	if (showTop) {
-		l.preview = QRectF(x0, y0, W / 2.0, topH * s);
-		l.program = QRectF(x0 + W / 2.0, y0, W / 2.0, topH * s);
+	QStringList names;
+	obs_frontend_source_list scenes = {};
+	obs_frontend_get_scenes(&scenes);
+	for (size_t i = 0; i < scenes.sources.num; i++) {
+		const QString n = QString::fromUtf8(obs_source_get_name(scenes.sources.array[i]));
+		if (!n.startsWith(QStringLiteral("--"))) // séparateurs "-----|Caméra|-----"
+			names << n;
 	}
-	l.cells.reserve(rows * cols);
+	obs_frontend_source_list_free(&scenes);
+	return names;
+}
+
+/* ------------------------------------------------------------------ */
+/* Modèles                                                            */
+
+static void addGrid(MvPreset &p, double x0, double y0, int rows, int cols, double w, double h, int kind)
+{
 	for (int r = 0; r < rows; r++)
 		for (int c = 0; c < cols; c++)
-			l.cells.emplace_back(x0 + c * cellW * s, y0 + topH * s + r * cellH * s, cellW * s, cellH * s);
-	return l;
+			p.tiles.push_back({QRectF(x0 + c * w, y0 + r * h, w, h), kind});
+}
+
+const std::vector<MvPreset> &mvPresets()
+{
+	static std::vector<MvPreset> presets = [] {
+		std::vector<MvPreset> v;
+
+		MvPreset a{"PresetTop18", {}};
+		a.tiles.push_back({QRectF(0, 0, 960, 540), MV_PREVIEW});
+		a.tiles.push_back({QRectF(960, 0, 960, 540), MV_PROGRAM});
+		addGrid(a, 0, 540, 3, 6, 320, 180, MV_SOURCE);
+		v.push_back(a);
+
+		MvPreset b{"PresetTop8", {}};
+		b.tiles.push_back({QRectF(0, 0, 960, 540), MV_PREVIEW});
+		b.tiles.push_back({QRectF(960, 0, 960, 540), MV_PROGRAM});
+		addGrid(b, 0, 540, 2, 4, 480, 270, MV_SOURCE);
+		v.push_back(b);
+
+		MvPreset c{"PresetBigProgram", {}};
+		c.tiles.push_back({QRectF(0, 0, 1440, 810), MV_PROGRAM});
+		c.tiles.push_back({QRectF(1440, 0, 480, 270), MV_PREVIEW});
+		addGrid(c, 1440, 270, 3, 1, 480, 270, MV_SOURCE);
+		addGrid(c, 0, 810, 1, 3, 480, 270, MV_SOURCE);
+		v.push_back(c);
+
+		MvPreset d{"PresetGrid16", {}};
+		addGrid(d, 0, 0, 4, 4, 480, 270, MV_SOURCE);
+		v.push_back(d);
+
+		MvPreset e{"PresetEmpty", {}};
+		v.push_back(e);
+		return v;
+	}();
+	return presets;
 }
 
 void MvSnapshot::release()
 {
-	for (Item &i : cells) {
+	for (Item &i : tiles) {
 		obs_source_release(i.src);
 		obs_source_release(i.label);
 	}
-	cells.clear();
+	tiles.clear();
 	obs_source_release(previewScene);
 	obs_source_release(programScene);
 	obs_source_release(previewLabel);
@@ -135,16 +173,15 @@ MvSnapshot MvState::snapshot()
 {
 	MvSnapshot s;
 	std::lock_guard<std::mutex> lock(mtx);
-	s.rows = rows_;
-	s.cols = cols_;
-	s.showTop = showTop_;
 	s.showLabels = showLabels_;
-	s.cells.reserve(cells_.size());
-	for (MvCell &c : cells_) {
+	s.tiles.reserve(tiles_.size());
+	for (MvTile &t : tiles_) {
 		MvSnapshot::Item it;
-		it.src = c.weak ? obs_weak_source_get_source(c.weak) : nullptr;
-		it.label = obs_source_get_ref(c.label);
-		s.cells.push_back(it);
+		it.rect = t.rect;
+		it.kind = t.kind;
+		it.src = t.weak ? obs_weak_source_get_source(t.weak) : nullptr;
+		it.label = obs_source_get_ref(t.label);
+		s.tiles.push_back(it);
 	}
 	s.previewScene = preview_ ? obs_weak_source_get_source(preview_) : nullptr;
 	s.programScene = program_ ? obs_weak_source_get_source(program_) : nullptr;
@@ -153,22 +190,39 @@ MvSnapshot MvState::snapshot()
 	return s;
 }
 
-int MvState::rows()
+int MvState::tileCount()
 {
 	std::lock_guard<std::mutex> lock(mtx);
-	return rows_;
+	return (int)tiles_.size();
 }
 
-int MvState::cols()
+QRectF MvState::tileRect(int i)
 {
 	std::lock_guard<std::mutex> lock(mtx);
-	return cols_;
+	return (i >= 0 && i < (int)tiles_.size()) ? tiles_[i].rect : QRectF();
 }
 
-bool MvState::showTop()
+int MvState::tileKind(int i)
 {
 	std::lock_guard<std::mutex> lock(mtx);
-	return showTop_;
+	return (i >= 0 && i < (int)tiles_.size()) ? tiles_[i].kind : MV_EMPTY;
+}
+
+QString MvState::tileName(int i)
+{
+	obs_source_t *src = nullptr;
+	QString n;
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		if (i < 0 || i >= (int)tiles_.size())
+			return QString();
+		src = tiles_[i].weak ? obs_weak_source_get_source(tiles_[i].weak) : nullptr;
+		n = tiles_[i].name;
+	}
+	if (src) // la source a peut-être été renommée
+		n = QString::fromUtf8(obs_source_get_name(src));
+	obs_source_release(src);
+	return n;
 }
 
 bool MvState::showLabels()
@@ -177,116 +231,130 @@ bool MvState::showLabels()
 	return showLabels_;
 }
 
-int MvState::cellCount()
+int MvState::addTile(const QRectF &rect, int kind, const QString &name)
 {
-	std::lock_guard<std::mutex> lock(mtx);
-	return (int)cells_.size();
-}
-
-QString MvState::cellName(int idx)
-{
-	obs_source_t *src = nullptr;
-	QString n;
+	MvTile t;
+	makeContent(t, kind, name);
+	t.rect = clampRect(rect);
+	int idx;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
-		if (idx < 0 || idx >= (int)cells_.size())
-			return QString();
-		src = cells_[idx].weak ? obs_weak_source_get_source(cells_[idx].weak) : nullptr;
-		n = cells_[idx].name;
+		tiles_.push_back(t);
+		idx = (int)tiles_.size() - 1;
 	}
-	/* le nom peut avoir changé (source renommée) */
-	if (src)
-		n = QString::fromUtf8(obs_source_get_name(src));
-	obs_source_release(src); // hors verrou
-	return n;
-}
-
-void MvState::setCellInternal(int idx, const QString &name)
-{
-	MvCell fresh = makeCell(name); // hors verrou (peut toucher au graphique)
-	MvCell old;
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		if (idx >= 0 && idx < (int)cells_.size()) {
-			old = cells_[idx];
-			cells_[idx] = fresh;
-			fresh = MvCell();
-		}
-	}
-	releaseCell(old);
-	releaseCell(fresh); // si idx invalide
-}
-
-void MvState::setCell(int idx, const QString &name)
-{
-	setCellInternal(idx, name);
 	save();
+	return idx;
 }
 
-void MvState::swapCells(int a, int b)
+void MvState::removeTile(int i)
 {
+	MvTile old;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
-		if (a < 0 || b < 0 || a >= (int)cells_.size() || b >= (int)cells_.size() || a == b)
+		if (i < 0 || i >= (int)tiles_.size())
 			return;
-		std::swap(cells_[a], cells_[b]);
+		old = tiles_[i];
+		tiles_.erase(tiles_.begin() + i);
 	}
+	releaseContent(old);
 	save();
 }
 
-void MvState::replaceCells(std::vector<MvCell> &&newCells)
+void MvState::setTileRect(int i, const QRectF &rect, bool saveNow)
 {
-	std::vector<MvCell> old;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
-		old.swap(cells_);
-		cells_ = std::move(newCells);
+		if (i < 0 || i >= (int)tiles_.size())
+			return;
+		tiles_[i].rect = clampRect(rect);
 	}
-	for (MvCell &c : old)
-		releaseCell(c);
+	if (saveNow)
+		save();
 }
 
-void MvState::setGrid(int rows, int cols)
+void MvState::setTileContent(int i, int kind, const QString &name)
 {
-	rows = std::clamp(rows, 1, 8);
-	cols = std::clamp(cols, 1, 10);
-
-	std::vector<MvCell> current;
-	int oldCols;
+	MvTile fresh;
+	makeContent(fresh, kind, name);
+	MvTile old;
+	bool ok = false;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
-		current.swap(cells_);
-		oldCols = cols_;
-		rows_ = rows;
-		cols_ = cols;
-	}
-
-	/* on garde chaque case à la même position (ligne, colonne) si elle existe encore */
-	std::vector<MvCell> next(rows * cols);
-	for (int i = 0; i < (int)current.size(); i++) {
-		const int r = oldCols ? i / oldCols : 0;
-		const int c = oldCols ? i % oldCols : 0;
-		if (r < rows && c < cols) {
-			next[r * cols + c] = current[i];
-			current[i] = MvCell();
+		if (i >= 0 && i < (int)tiles_.size()) {
+			old = tiles_[i];
+			fresh.rect = old.rect;
+			tiles_[i] = fresh;
+			ok = true;
 		}
 	}
-	for (MvCell &c : current)
-		releaseCell(c);
-
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		cells_ = std::move(next);
-	}
+	releaseContent(ok ? old : fresh);
 	save();
 }
 
-void MvState::setShowTop(bool v)
+int MvState::raiseTile(int i)
 {
+	int idx = i;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
-		showTop_ = v;
+		if (i < 0 || i >= (int)tiles_.size())
+			return i;
+		MvTile t = tiles_[i];
+		tiles_.erase(tiles_.begin() + i);
+		tiles_.push_back(t);
+		idx = (int)tiles_.size() - 1;
 	}
+	save();
+	return idx;
+}
+
+int MvState::duplicateTile(int i)
+{
+	const QRectF r = tileRect(i);
+	if (r.isNull())
+		return -1;
+	return addTile(r.translated(40, 40), tileKind(i), tileName(i));
+}
+
+void MvState::replaceTiles(std::vector<MvTile> &&next)
+{
+	std::vector<MvTile> old;
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		old.swap(tiles_);
+		tiles_ = std::move(next);
+	}
+	for (MvTile &t : old)
+		releaseContent(t);
+}
+
+void MvState::applyPreset(size_t presetIdx)
+{
+	const auto &presets = mvPresets();
+	if (presetIdx >= presets.size())
+		return;
+	const QStringList names = sceneNames();
+	int n = 0;
+
+	std::vector<MvTile> next;
+	for (const auto &pt : presets[presetIdx].tiles) {
+		MvTile t;
+		if (pt.second == MV_SOURCE)
+			makeContent(t, n < names.size() ? MV_SOURCE : MV_EMPTY,
+				    n < names.size() ? names[n] : QString());
+		else
+			makeContent(t, pt.second, QString());
+		if (pt.second == MV_SOURCE)
+			n++;
+		t.rect = pt.first;
+		next.push_back(t);
+	}
+	replaceTiles(std::move(next));
+	save();
+}
+
+void MvState::clearAll()
+{
+	replaceTiles(std::vector<MvTile>());
 	save();
 }
 
@@ -296,41 +364,6 @@ void MvState::setShowLabels(bool v)
 		std::lock_guard<std::mutex> lock(mtx);
 		showLabels_ = v;
 	}
-	save();
-}
-
-void MvState::clearCells()
-{
-	const int n = cellCount();
-	std::vector<MvCell> empty(n);
-	replaceCells(std::move(empty));
-	save();
-}
-
-void MvState::autoFill()
-{
-	QStringList names;
-	obs_frontend_source_list scenes = {};
-	obs_frontend_get_scenes(&scenes);
-	for (size_t i = 0; i < scenes.sources.num; i++) {
-		const QString n = QString::fromUtf8(obs_source_get_name(scenes.sources.array[i]));
-		if (n.startsWith(QStringLiteral("--"))) // séparateurs du genre "-----|Caméra|-----"
-			continue;
-		names << n;
-	}
-	obs_frontend_source_list_free(&scenes);
-
-	int r = rows(), c = cols();
-	while (r * c < names.size() && r < 8)
-		r++;
-	if (r != rows())
-		setGrid(r, c);
-
-	const int n = cellCount();
-	loading_ = true;
-	for (int i = 0; i < n; i++)
-		setCellInternal(i, i < names.size() ? names[i] : QString());
-	loading_ = false;
 	save();
 }
 
@@ -344,7 +377,6 @@ void MvState::refreshFrontend()
 	obs_weak_source_t *wPrev = prev ? obs_source_get_weak_source(prev) : nullptr;
 	obs_source_release(prog);
 	obs_source_release(prev);
-
 	{
 		std::lock_guard<std::mutex> lock(mtx);
 		std::swap(program_, wProg);
@@ -368,7 +400,7 @@ void MvState::createTopLabels()
 }
 
 /* ------------------------------------------------------------------ */
-/* Sauvegarde : un réglage par collection de scènes                   */
+/* Sauvegarde (une disposition par collection de scènes)              */
 
 static QString configPath()
 {
@@ -402,42 +434,44 @@ static QJsonObject readRoot()
 void MvState::load()
 {
 	const QJsonObject cfg = readRoot()["collections"].toObject()[currentCollection()].toObject();
-
 	loading_ = true;
-	if (cfg.isEmpty()) {
-		{
-			std::lock_guard<std::mutex> lock(mtx);
-			showTop_ = true;
-			showLabels_ = true;
+
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		showLabels_ = cfg["showLabels"].toBool(true);
+	}
+
+	if (cfg.contains("tiles")) {
+		std::vector<MvTile> next;
+		for (const QJsonValue &v : cfg["tiles"].toArray()) {
+			const QJsonObject o = v.toObject();
+			MvTile t;
+			makeContent(t, o["kind"].toInt(MV_EMPTY), o["name"].toString());
+			t.rect = clampRect(QRectF(o["x"].toDouble(), o["y"].toDouble(), o["w"].toDouble(480),
+						  o["h"].toDouble(270)));
+			next.push_back(t);
 		}
-		setGrid(3, 6);
+		replaceTiles(std::move(next));
 		loaded_ = true;
 		loading_ = false;
-		autoFill(); // première fois : on remplit avec les scènes
 		return;
 	}
 
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		showTop_ = cfg["showTop"].toBool(true);
-		showLabels_ = cfg["showLabels"].toBool(true);
-	}
-	const int r = std::clamp(cfg["rows"].toInt(3), 1, 8);
-	const int c = std::clamp(cfg["cols"].toInt(6), 1, 10);
-
-	std::vector<MvCell> next(r * c);
-	const QJsonArray arr = cfg["cells"].toArray();
-	for (int i = 0; i < r * c && i < arr.size(); i++)
-		next[i] = makeCell(arr[i].toString());
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		rows_ = r;
-		cols_ = c;
-	}
-	replaceCells(std::move(next));
-
 	loaded_ = true;
 	loading_ = false;
+
+	if (cfg.contains("cells")) {
+		/* ancienne version (grille) : on reprend les noms dans le modèle 3x6 */
+		applyPreset(0);
+		const QJsonArray cells = cfg["cells"].toArray();
+		const int first = 2; // après Aperçu / Programme
+		for (int i = 0; i < cells.size() && first + i < tileCount(); i++)
+			setTileContent(first + i, cells[i].toString().isEmpty() ? MV_EMPTY : MV_SOURCE,
+				       cells[i].toString());
+		return;
+	}
+
+	applyPreset(0); // première fois
 }
 
 void MvState::save()
@@ -445,22 +479,28 @@ void MvState::save()
 	if (!loaded_ || loading_)
 		return;
 
-	QJsonObject cfg;
 	QJsonArray arr;
-	const int n = cellCount();
-	for (int i = 0; i < n; i++)
-		arr.append(cellName(i));
-	cfg["rows"] = rows();
-	cfg["cols"] = cols();
-	cfg["showTop"] = showTop();
+	const int n = tileCount();
+	for (int i = 0; i < n; i++) {
+		const QRectF r = tileRect(i);
+		QJsonObject o;
+		o["x"] = r.x();
+		o["y"] = r.y();
+		o["w"] = r.width();
+		o["h"] = r.height();
+		o["kind"] = tileKind(i);
+		o["name"] = tileName(i);
+		arr.append(o);
+	}
+	QJsonObject cfg;
+	cfg["tiles"] = arr;
 	cfg["showLabels"] = showLabels();
-	cfg["cells"] = arr;
 
 	QJsonObject root = readRoot();
 	QJsonObject cols = root["collections"].toObject();
 	cols[currentCollection()] = cfg;
 	root["collections"] = cols;
-	root["version"] = 2;
+	root["version"] = 3;
 
 	QFile f(configPath());
 	if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -474,8 +514,7 @@ void MvState::shutdown()
 {
 	save();
 	loaded_ = false;
-
-	replaceCells(std::vector<MvCell>());
+	replaceTiles(std::vector<MvTile>());
 
 	obs_weak_source_t *wp = nullptr, *wg = nullptr;
 	obs_source_t *lp = nullptr, *lg = nullptr;
